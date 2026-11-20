@@ -13,6 +13,7 @@ import android.view.InputDevice;
 public final class GameActivity extends NativeActivity implements InputManager.InputDeviceListener {
     static { System.loadLibrary("nxnative"); }   // loaded through this class's loader, so the native method below resolves (NativeActivity then opens the same library)
     private static native void nativePadConnected(boolean connected);
+    private static native int nativeLoading();   // 1 while the game loads (android_main.c: a burst of its file reads)
     private static native long nativeFrames();   // frames the engine has presented (android_main.c), -1 before it draws
     private InputManager im;
     static volatile boolean alive;   // the game runs in this process (SetupActivity: the app icon goes back to it rather than to the setup screen)
@@ -28,7 +29,7 @@ public final class GameActivity extends NativeActivity implements InputManager.I
         // shaders the game captured last time: hand over to it before there is a window (the engine starts with the window, android_main.c)
         //   (alive only after this: set before it, the setup screen took this finishing activity for a running game and sent the player back to it, round and round;
         //   the game named, so the launcher of two games does not come in between)
-        if (!viaSetup && SetupActivity.pendingWork(GameSettings.dir(this))) { startActivity(new Intent(this, SetupActivity.class).putExtra("game", GameSettings.game(this)[0])); finish(); return; }
+        if (!viaSetup && (SetupActivity.pendingWork(GameSettings.dir(this)) || SetupActivity.shadersStale(this, GameSettings.dir(this)))) { startActivity(new Intent(this, SetupActivity.class).putExtra("game", GameSettings.game(this)[0])); finish(); return; }
         alive = true;
         im = getSystemService(InputManager.class);
         if (im != null) im.registerInputDeviceListener(this, null);
@@ -36,7 +37,54 @@ public final class GameActivity extends NativeActivity implements InputManager.I
         liveShaders();
         handheld();
         if (GameSettings.get(this, "DM_PERF_OVERLAY").equals("on")) perfOverlay(true);
+        displayMode(); sustained(); loadH.postDelayed(loadPoll, 2000);
     }
+    // ---------- the display matched to the game, always (no setting; DM_DISPLAY_RATE=phone in env.txt leaves the phone's own rate, for comparing) ----------
+    // The lowest display mode of at least 60 Hz that the game's frames divide evenly: 60 Hz for a 30 fps game on a 120 Hz phone, which otherwise keeps its
+    //   panel at 120 (more power, more heat, and a hot phone slows down) or drops it to 30 (a late frame then waits a whole 33 ms refresh). With frame
+    //   generation on: 120 Hz, as android_main.c window_rate asks (each picture gets a timed slot). The engine reads the new rate within a second
+    void displayMode() {
+        if (android.os.Build.VERSION.SDK_INT < 30) return;
+        try {
+            android.view.Display d = getDisplay(); if (d == null) return;
+            int want = 0;
+            if (!GameSettings.get(this, "DM_DISPLAY_RATE").equals("phone")) {
+                String fg = GameSettings.get(this, "DM_FRAMEGEN"); boolean gen = GameSettings.experimentsUnlocked(this) && !fg.isEmpty() && !fg.equals("off");   // (locked off for now)
+                String f = GameSettings.get(this, "DM_FPS_TARGET"); int fps = f.equals("60") ? 60 : 30;
+                android.view.Display.Mode cur = d.getMode(), best = null;
+                for (android.view.Display.Mode m : d.getSupportedModes()) {
+                    if (m.getPhysicalWidth() != cur.getPhysicalWidth() || m.getPhysicalHeight() != cur.getPhysicalHeight()) continue;
+                    int r = Math.round(m.getRefreshRate());
+                    if (gen ? (r < 120 || r % 60 != 0) : (r < 60 || r % fps != 0)) continue;
+                    if (best == null || m.getRefreshRate() < best.getRefreshRate()) best = m;
+                }
+                if (best != null) want = best.getModeId();
+            }
+            android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();
+            if (lp.preferredDisplayModeId != want) { lp.preferredDisplayModeId = want; getWindow().setAttributes(lp); }
+        } catch (RuntimeException e) { }
+    }
+    // ---------- sustained performance (DM_SUSTAINED=on, on phones that offer it): clocks the phone can hold for hours instead of its peak, which it cannot hold
+    //   once hot (a Galaxy S25+ fell from 4.47 to 1.4 GHz in a long session); steadier, a little slower at first ----------
+    static boolean sustainedSupported(android.content.Context c) {
+        android.os.PowerManager pm = c.getSystemService(android.os.PowerManager.class); return pm != null && pm.isSustainedPerformanceModeSupported();
+    }
+    void sustained() {
+        try { getWindow().setSustainedPerformanceMode(GameSettings.get(this, "DM_SUSTAINED").equals("on") && sustainedSupported(this)); } catch (RuntimeException e) { }
+    }
+    // ---------- loading (android_main.c nativeLoading): told to Android 13+ (GameManager.setGameState), which can raise the clocks and storage speed for it ----------
+    private final android.os.Handler loadH = new android.os.Handler(android.os.Looper.getMainLooper()); private int loadWas = -1;
+    private final Runnable loadPoll = new Runnable() { @Override public void run() {
+        int l; try { l = nativeLoading(); } catch (UnsatisfiedLinkError e) { return; }
+        if (l != loadWas && android.os.Build.VERSION.SDK_INT >= 33) { loadWas = l;
+            try { Api33.loading(GameActivity.this, l == 1); } catch (RuntimeException | LinkageError e) { } }
+        if (alive) loadH.postDelayed(this, 500);
+    } };
+    // Android 13's GameState in a class of its own, loaded only on 13+: inside the poller above, Android 12's verifier rejected the whole class over it and the app closed at
+    //   the Game Freak logo (Arceus-Native-Android #19, a Snapdragon 865 on Android 12)
+    private static final class Api33 { static void loading(android.content.Context c, boolean on) {
+        android.app.GameManager gm = c.getSystemService(android.app.GameManager.class);
+        if (gm != null) gm.setGameState(new android.app.GameState(on, android.app.GameState.MODE_GAMEPLAY_INTERRUPTIBLE)); } }
     // ---------- rumble (hle_hid.c → touch_ui.c dm_rumble): the game's motor strength 0..1, about every 100 ms while it lasts, on the engine's haptic thread ----------
     // the controller's own motor when the one in use has one, else the phone's (DM_RUMBLE: "" both, "pad" controllers only, "off" none); each call is a 150 ms pulse
     private volatile android.os.Vibrator padVib; private android.os.Vibrator phoneVib; private String rumbleMode; private long rumbleRead;
@@ -62,7 +110,7 @@ public final class GameActivity extends NativeActivity implements InputManager.I
     private void handheld() {
         String h = GameSettings.handheld(); if (h == null || !GameSettings.get(this, "DM_HANDHELD_TOLD").isEmpty()) return;
         GameSettings.set(this, "DM_HANDHELD_TOLD", "1");
-        hint(T.t(this, "%s: its built-in controls are used. Hold − and + together for 1 s for the menu.", h));
+        hint(T.t(this, "%s: its built-in controls are used. Hold \u2212 and + together for 1 s for the menu.", h));
     }
     // a one-line hint at the top of the screen for a few seconds: not a pop-up (it takes no touch and no focus), the game keeps running and keeps its input
     private void hint(String s) {
@@ -95,7 +143,7 @@ public final class GameActivity extends NativeActivity implements InputManager.I
     private String gpuName;
     private String perfLine() {
         long f = -1, now = android.os.SystemClock.uptimeMillis(); try { f = nativeFrames(); } catch (UnsatisfiedLinkError e) { }
-        String fps = "–"; if (f >= 0 && perfFrames >= 0 && now > perfT) fps = String.valueOf(Math.round((f - perfFrames) * 1000.0 / (now - perfT))); perfFrames = f; perfT = now;
+        String fps = "\u2013"; if (f >= 0 && perfFrames >= 0 && now > perfT) fps = String.valueOf(Math.round((f - perfFrames) * 1000.0 / (now - perfT))); perfFrames = f; perfT = now;
         Intent bat = registerReceiver(null, new android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         float temp = bat != null ? bat.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, 0) / 10f : 0;
         int level = bat != null ? bat.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) * 100 / Math.max(1, bat.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100)) : -1;
@@ -103,7 +151,7 @@ public final class GameActivity extends NativeActivity implements InputManager.I
         if (gpuName == null || gpuName.isEmpty()) { gpuName = ""; try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(new File(GameSettings.dir(this), "gpu.txt")))) { String l = r.readLine(); if (l != null) gpuName = l.trim(); } catch (java.io.IOException e) { } }
         android.os.PowerManager pm = getSystemService(android.os.PowerManager.class); String heat = "";
         if (pm != null) { int s = pm.getCurrentThermalStatus(); heat = s >= android.os.PowerManager.THERMAL_STATUS_SEVERE ? " " + T.t(this, "hot") : s >= android.os.PowerManager.THERMAL_STATUS_MODERATE ? " " + T.t(this, "warm") : ""; }
-        return String.format(java.util.Locale.ROOT, "%s fps · %.0f °C%s · %s · %s %.1f GB · %d%%", fps, temp, heat, gpuName.isEmpty() ? "GPU" : gpuName, T.t(this, "free"), mi.availMem / 1e9, level);
+        return String.format(java.util.Locale.ROOT, "%s fps \u00B7 %.0f \u00B0C%s \u00B7 %s \u00B7 %s %.1f GB \u00B7 %d%%", fps, temp, heat, gpuName.isEmpty() ? "GPU" : gpuName, T.t(this, "free"), mi.availMem / 1e9, level);
     }
     // Shaders the game saves while it runs (a mod's new effect, nvn_vk.c mtl_shader_seen): translated now in the background into the folder the engine watches
     // (setup_game.py --captures --live, nvn_vk.c live_check), so they draw a few seconds later instead of after a restart. Kept out of the game's way on every phone, nothing
@@ -127,7 +175,7 @@ public final class GameActivity extends NativeActivity implements InputManager.I
         }, "live shaders");
         t.setPriority(Thread.MIN_PRIORITY); t.setDaemon(true); t.start();
     }
-    @Override protected void onResume() { super.onResume(); check(); }
+    @Override protected void onResume() { super.onResume(); check(); displayMode(); }
     // am start ... --es menu <page>: the settings panel (testing over adb; 1 = the controller buttons)
     @Override protected void onNewIntent(Intent i) { super.onNewIntent(i); String m = i.getStringExtra("menu"); if (m != null) GameMenu.show(this, m.equals("1") ? 1 : 0); }
     @Override protected void onActivityResult(int req, int res, Intent data) { if (!GameMenu.onResult(this, req, res, data)) super.onActivityResult(req, res, data); }   // the in-game menu's file pickers
@@ -156,6 +204,15 @@ public final class GameActivity extends NativeActivity implements InputManager.I
             // Sword / Shield: no split submissions (nvn_vk.c sub_split): they need none (3-5 ms of work a frame on a Galaxy S25+) and with them Sword flashed white
             //   (v0.40, pulled); Scarlet / Violet keep them, they hold 30 fps with them. env.txt's own DM_VK_SPLIT wins
             if (!GameSettings.paldea(this) && GameSettings.get(this, "DM_VK_SPLIT").isEmpty()) android.system.Os.setenv("DM_VK_SPLIT", "0", true);
+            // On budget chips (sd6 / low):
+            // 1) disable background texture pre-uploading to prevent GPU queue stalls
+            // 2) default to dynamic real-time game speed so the game runs at full speed instead of slow motion
+            // 3) default to 45% 3D render scale to cut fragment shading by 33%
+            if ("sd6".equals(p[0]) || "low".equals(p[0])) {
+                if (GameSettings.get(this, "DM_VK_PREUPLOAD").isEmpty()) android.system.Os.setenv("DM_VK_PREUPLOAD", "0", true);
+                if (GameSettings.get(this, "DM_GAME_STEP").isEmpty()) android.system.Os.setenv("DM_GAME_STEP", "realtime", true);
+                if (GameSettings.get(this, "DM_RES_CAP").isEmpty()) android.system.Os.setenv("DM_RES_CAP", "0.45", true);
+            }
             StringBuilder hz = new StringBuilder(); for (float r : GameSettings.refreshRates(this)) hz.append(hz.length() > 0 ? "," : "").append(Math.round(r));
             android.system.Os.setenv("DM_DISPLAY_HZ", hz.toString(), true);
         } catch (Exception e) { }

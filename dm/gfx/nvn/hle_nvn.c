@@ -389,6 +389,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     OLOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void *)t, o->d.width, o->d.height, o->d.depth,
          o->d.levels, o->d.format, o->d.target, o->d.flags, o->L.size);
     ft_add(o);
+    { extern void mtl_tex_preupload(const tex_t *t) __attribute__((weak)); if (mtl_tex_preupload) mtl_tex_preupload(o); }   // (nvn_vk.c: uploaded ahead by a worker)
     return 1;
 }
 NVN(nvnTextureFinalize, void, NVNtexture *t) { rq_drain(); ft_del(TX(t)->serial); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
@@ -574,9 +575,11 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     return r;
 }
 static NVNsyncWaitResult sync_wait_(const sync_t *o, uint64_t timeout) {
-    if (timeout) rq_drain();   // (a wait with a timeout: what is queued comes first. A poll just reads: not fenced yet is not signalled)
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
-    if (mtl_wait(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    if (o->fence == 0) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    if (o->fence != UINT64_MAX && mtl_wait(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    if (timeout && o->fence == UINT64_MAX) rq_drain();
+    if (o->fence == UINT64_MAX) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     return mtl_wait(o->fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
@@ -1067,8 +1070,16 @@ typedef struct { int kind, n, idx; uint64_t *h; NVNqueue *q; sync_t *s; win_t *o
 enum { RQ_N = 512 };
 static rq_item g_rq[RQ_N]; static uint64_t g_rq_head, g_rq_tail; static int g_rq_presents;
 static pthread_mutex_t g_rq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_rq_cv = PTHREAD_COND_INITIALIZER;
-static int rq_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ASYNC"); v = e && strcmp(e, "off") && strcmp(e, "0"); if (v) LOG("[nvn] the replay runs on its own thread (DM_NVN_ASYNC)"); } return v; }
+// DM_NVN_ASYNC=1 on, 0 / off off; unset (Auto): on for Adreno, where it is tested (a Galaxy S25+ went from 42 ms frames to a steady 33 at 30 fps, the replay's 28-33 ms
+//   moved off the game's thread), off for other GPUs until it has been run there
+const char *nvn_vk_gpu_name(void) __attribute__((weak));
+static int rq_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ASYNC"); const char *g = nvn_vk_gpu_name ? nvn_vk_gpu_name() : NULL;
+    int autoon = !(e && *e) && g && strstr(g, "Adreno");
+    v = autoon || (e && *e && strcmp(e, "off") && strcmp(e, "0"));
+    LOG("[nvn] the replay %s (DM_NVN_ASYNC %s)", v ? "runs on its own thread" : "runs on the game's thread", e && *e ? e : autoon ? "Auto: on for Adreno" : "Auto: off for this GPU"); } return v; }
 static const char *volatile g_rq_at = "idle";
+static _Atomic int g_rq_tid;
+int nvn_rq_tid(void) { return atomic_load(&g_rq_tid); }
 // A wait on the replay thread that takes this long has gone wrong: said in the log with who is waiting and what the replay thread is doing
 static void rq_wait(const char *who) {
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 5;
@@ -1078,6 +1089,10 @@ static void rq_wait(const char *who) {
 }
 static void *rq_main(void *a) {
     (void)a;
+#if defined(__ANDROID__)
+    atomic_store(&g_rq_tid, (int)gettid());
+    setpriority(PRIO_PROCESS, (id_t)gettid(), -10);
+#endif
     for (;;) {
         pthread_mutex_lock(&g_rq_mu);
         while (g_rq_tail == g_rq_head) pthread_cond_wait(&g_rq_cv, &g_rq_mu);
@@ -1085,7 +1100,7 @@ static void *rq_main(void *a) {
         pthread_mutex_unlock(&g_rq_mu);
         if (it.kind == RQ_SUBMIT) { g_rq_at = "submit"; sub_run(it.q, it.n, (const NVNcommandHandle *)it.h); free(it.h); }
         else if (it.kind == RQ_FENCE) { g_rq_at = "fence"; it.s->fence = mtl_last_fence(); }
-        else { g_rq_at = "present"; gfx_enter(); uint64_t t = mtl_present(CTX(it.o->tex[it.idx]), it.period, it.crop); it.o->ticket[it.idx] = t; gfx_leave(); }
+        else { g_rq_at = "present"; gfx_enter(); uint64_t t = mtl_present(CTX(it.o->tex[it.idx]), it.period, it.crop); it.o->ticket[it.idx] = t; __atomic_store_n(&it.o->pfence[it.idx], mtl_last_fence(), __ATOMIC_RELEASE); gfx_leave(); }
         g_rq_at = "idle";
         pthread_mutex_lock(&g_rq_mu);
         g_rq_tail++; if (it.kind == RQ_PRESENT) g_rq_presents--;
@@ -1266,7 +1281,9 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     //   draws the last one, as on the console. Fenced with everything submitted so far, the game waited on its sync for the whole of the frame it had just submitted
     //   (Violet on a Galaxy S25+: 24.6 ms of each 43 ms frame, CPU and GPU taking turns). DM_NVN_ACQUIRE_FENCE=all: the old fence
     { static int all = -1; if (all < 0) { const char *e = getenv("DM_NVN_ACQUIRE_FENCE"); all = e && !strcmp(e, "all"); }
-      if (s && !all && !rq_on() && *idx < 4 && o->pfence[*idx]) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = o->pfence[*idx]; }
+      uint64_t pf = *idx < 4 ? __atomic_load_n(&o->pfence[*idx], __ATOMIC_ACQUIRE) : 0;
+      if (s && !all && *idx < 4 && pf) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = pf; }
+      else if (s && !all && *idx < 4 && !pf) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = 0; }
       else if (s) sync_fence_now((sync_t *)s); }
     // (the swapchain texture is available once the work fenced above is done; an `if (0)` left here made the frame-start line below dead code)
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
@@ -1384,7 +1401,8 @@ static void tsummary(uint64_t frame) {
         double v[TWIN]; memcpy(v, g_tw[k], n * sizeof *v); qsort(v, n, sizeof *v, dcmp);
         o += snprintf(line + o, sizeof line - o, " %s p50 %.2f / p95 %.2f / max %.2f ms (%u frames);", g_tname[k], v[n / 2], v[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1], v[n - 1], n);
     }
-    LOG("[nvn] timing up to frame %llu:%s", frame, line);
+    { extern int dm_ab_side(void) __attribute__((weak)); int ab = dm_ab_side ? dm_ab_side() : -1;   // (DM_AB: which side this window ran on; use a multiple of 300 frames)
+      if (ab >= 0) LOG("[nvn] timing up to frame %llu (ab %d):%s", frame, ab, line); else LOG("[nvn] timing up to frame %llu:%s", frame, line); }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > tgt;
@@ -1509,6 +1527,7 @@ static nvn_fstep g_fs;   // present thread only
 static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided yet)
 // Shield's high frame rate (loader.c fps_patch, DM_FPS_TARGET): the same controller with slots of 1 / dm_step_hz, the step going into the game's own step word
 __attribute__((weak)) int dm_step_hz; __attribute__((weak)) uint8_t *dm_step_word;   // graphics unit tests have no loader
+__attribute__((weak)) uint8_t *dm_step_table;   // the game's 5-entry table (loader.c): intervals 1-5
 __attribute__((weak)) int dm_fps_live;   // loader.c: the live target, 30 or 60 (0: not live); the menu changes it while playing
 static int vstep_on(void) { return &dm_step_hz && dm_step_hz > 0 && &dm_step_word && dm_step_word && !dm_detclock_enabled(); }
 static int live_fps(void) { return &dm_fps_live ? __atomic_load_n(&dm_fps_live, __ATOMIC_RELAXED) : 0; }
@@ -1584,11 +1603,19 @@ static void fstep_tick(const win_t *o) {
 }
 // A frame that keeps its slot is held 1 slot and the game steps 1 slot; when frames run late the hold steps up (60 → 30 → 20 fps at 60) and the game steps as many slots
 static nvn_fstep g_vs;   // present thread only
+static _Atomic int g_game_step_mode = -1;   // 0: steady, 1: realtime
+void dm_game_step_set(const char *val) {
+    int m = (val && !strcmp(val, "realtime")) ? 1 : 0;
+    atomic_store(&g_game_step_mode, m);
+    LOG("[nvn] game step mode changed live: %s", m == 1 ? "real time (dynamic delta time, no slow motion)" : "steady (fixed 33.3 ms step)");
+}
 static void vstep_tick(const win_t *o) {
     static uint64_t prev, held[FSTEP_MAX + 1]; static int nlog;
     const double v = 1e9 / dm_step_hz;
     uint64_t st = g_fs_start ? g_fs_start : now_ns(), pw = g_fs_wait; g_fs_start = g_fs_wait = 0;
-    double shown = prev ? (st - prev) / v : 0, gpu = 0; prev = st;
+    double shown = prev ? (st - prev) / v : 0, gpu = 0;
+    uint64_t elapsed_ns = (prev && st > prev) ? (st - prev) : (uint64_t)v;
+    prev = st;
     for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; break; } }
     double cpu = shown - pw / v;
     // the game's own work for the last frame (present return to the next present: its code and submissions, not the pacing wait). The wait for the slot is taken in
@@ -1598,8 +1625,53 @@ static void vstep_tick(const win_t *o) {
     double cost = cpu > gpu ? cpu : gpu;
     // at most 2 slots: 30 fps is the floor, 60 when frames fit (a 3-slot hold, 20 fps, swung the picture between 20 and 60). The live target 30 holds every frame 2
     int k0 = g_vs.k, n = nvn_fstep_next(&g_vs, shown, cost, live_fps() == 30 ? 2 : 1, 2, 0);
-    uint32_t ns = (uint32_t)(((uint64_t)n * 1000000000ull + (uint64_t)dm_step_hz - 1) / (uint64_t)dm_step_hz);
-    dm_guest_write_prepare(dm_step_word, 4); __atomic_store_n((uint32_t *)dm_step_word, ns, __ATOMIC_RELAXED);
+
+    int mode = atomic_load(&g_game_step_mode);
+    if (mode < 0) {
+        const char *e = getenv("DM_GAME_STEP");
+        mode = (e && !strcmp(e, "realtime")) ? 1 : 0;
+        atomic_store(&g_game_step_mode, mode);
+        LOG("[nvn] game step mode: %s", mode == 1 ? "real time (dynamic delta time, no slow motion)" : "steady (fixed 33.3 ms step)");
+    }
+
+    uint32_t ns;
+    if (mode == 1) {
+        static double s_smooth_ns = 33333334.0;
+        if (elapsed_ns > 100000000ull) elapsed_ns = 100000000ull;
+        if (elapsed_ns < 16666667ull) elapsed_ns = 16666667ull;
+        s_smooth_ns = s_smooth_ns * 0.75 + (double)elapsed_ns * 0.25;
+        uint64_t step_ns = (uint64_t)(s_smooth_ns + 0.5);
+        if (step_ns > 83333334ull) step_ns = 83333334ull;
+        if (step_ns < 16666667ull) step_ns = 16666667ull;
+        ns = (uint32_t)step_ns;
+
+        if (&dm_step_table && dm_step_table) {
+            dm_guest_write_prepare(dm_step_table, 40);
+            for (int i = 0; i < 5; i++) __atomic_store_n((uint64_t *)(dm_step_table + 8 * i), step_ns, __ATOMIC_RELAXED);
+        }
+        static uint32_t last_log_ms;
+        uint32_t cur_ms = (uint32_t)(step_ns / 1000000ull);
+        if (abs((int)cur_ms - (int)last_log_ms) >= 5 && nlog < 40) {
+            LOG("[nvn] game step: dynamic delta %.2f ms (%.1f effective game FPS, real time)", step_ns / 1e6, 1e9 / (double)step_ns);
+            last_log_ms = cur_ms;
+        }
+    } else {
+        ns = (uint32_t)((1000000000ull * (live_fps() == 30 && dm_step_hz == 60 ? 2 : 1) + (uint64_t)dm_step_hz - 1) / (uint64_t)dm_step_hz);
+        static const uint64_t own_table[5] = { 16666667, 33333334, 50000000, 66666667, 83333334 };
+        if (&dm_step_table && dm_step_table) {
+            dm_guest_write_prepare(dm_step_table, 40);
+            for (int i = 0; i < 5; i++) __atomic_store_n((uint64_t *)(dm_step_table + 8 * i), own_table[i], __ATOMIC_RELAXED);
+        }
+        static uint32_t last;
+        if (ns != last) {
+            LOG("[nvn] game step: %.2f ms a frame, as the 60 FPS mod", ns / 1e6);
+            last = ns;
+        }
+    }
+    if (&dm_step_word && dm_step_word) {
+        dm_guest_write_prepare(dm_step_word, 4);
+        __atomic_store_n((uint32_t *)dm_step_word, ns, __ATOMIC_RELAXED);
+    }
     atomic_store(&g_fs_k, g_vs.k); held[g_vs.k]++;
     if (k0 && g_vs.k != k0 && nlog < 40) LOG("[nvn] frame step: hold %d → %d slots of %.2f ms at present %llu (cost %.2f slots, GPU %.2f)%s", k0, g_vs.k, v / 1e6,
                                              (unsigned long long)o->presents, cost, gpu, ++nlog == 40 ? "; further changes not logged" : "");
@@ -1625,6 +1697,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
     dm_fps_lock_tick(); dm_res_scale_tick();
     if (dm_fps_state) { static int was; int c = fps_step_cap(); if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? " (prerendered movie)" : ""); was = c; } }
+    { extern void dm_fps_tick(void) __attribute__((weak)); if (dm_fps_tick) dm_fps_tick(); }   // (loader.c: the 60 fps patch deferred to a field area goes in)
     if (fstep_on()) fstep_tick(o); else if (vstep_on()) vstep_tick(o); else if (dyn_on()) dyn_tick(o);
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     present_cfg(o);
@@ -1641,7 +1714,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           atomic_store(&g_nvn_game_work_avg_ns, a ? a + (uint64_t)(((int64_t)w - (int64_t)a) / 16) : w); } }   // (the average over about 16 frames: the fps guard's CPU test)
     if (idx >= 0 && idx < o->ntex && idx < 4) {
         if (rq_on()) { rq_item it = { .kind = RQ_PRESENT, .o = o, .idx = idx, .period = present_period(o) / 1e9 }; memcpy(it.crop, o->crop, sizeof it.crop); gfx_leave(); rq_push(it); gfx_enter(); }
-        else { o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop); o->pfence[idx] = mtl_last_fence(); }   // enqueue only, return immediately
+        else { o->ticket[idx] = mtl_present(CTX(o->tex[idx]), present_period(o) / 1e9, o->crop); __atomic_store_n(&o->pfence[idx], mtl_last_fence(), __ATOMIC_RELEASE); }   // enqueue only, return immediately
     }
     gfx_leave();
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);

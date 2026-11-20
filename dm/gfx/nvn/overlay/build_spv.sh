@@ -1,7 +1,8 @@
 #!/bin/bash
 # The present path's shaders → SPIR-V headers (glslangValidator -V; on Windows it runs in WSL from Ubuntu's glslang-tools package, unpacked without installing):
 #   ovl.vert / ovl.frag → ovl_spv.h (the touch overlay), scale.vert / scale.frag → scale_spv.h (the sharpening upscaler),
-#   sgsr.vert + dm/third_party/sgsr/sgsr1_shader_mobile.frag → sgsr_spv.h (Snapdragon Game Super Resolution 1, Qualcomm, BSD-3-Clause: dm/third_party/sgsr/LICENSE).
+#   sgsr.vert + dm/third_party/sgsr/sgsr1_shader_mobile.frag → sgsr_spv.h (Snapdragon Game Super Resolution 1, Qualcomm, BSD-3-Clause: dm/third_party/sgsr/LICENSE),
+#   fg.vert + fg_luma / fg_flow / fg_stat / fg_gen.frag → fgen_spv.h (frame generation: nvn_fgen.h; their .spv files are not kept).
 # SGSR's file is used as Qualcomm publishes it; only its two plain uniforms become Vulkan declarations here (ViewportInfo as a push-constant block, the sampler at binding 0)
 set -e
 O=$(cd "$(dirname "$0")" && pwd); T=$O/../../../third_party/sgsr
@@ -9,6 +10,15 @@ G=${GLSLANG:-glslangValidator}
 $G -V "$O/ovl.vert" -o "$O/ovl.vert.spv"; $G -V "$O/ovl.frag" -o "$O/ovl.frag.spv"
 $G -V "$O/scale.vert" -o "$O/scale.vert.spv"; $G -V "$O/scale.frag" -o "$O/scale.frag.spv"
 W=$(mktemp -d)
+for f in fg.vert fg_luma.frag fg_flow.frag fg_stat.frag fg_gen.frag; do $G -V "$O/$f" -o "$W/$f.spv"; done
+python3 - "$W" "$O/fgen_spv.h" <<'EOF'
+import struct, sys
+out = '// Generated from fg.vert and fg_luma / fg_flow / fg_stat / fg_gen.frag (glslangValidator -V): frame generation (nvn_fgen.h)\n'
+for name, f in (('fg_vert', 'fg.vert'), ('fg_luma_frag', 'fg_luma.frag'), ('fg_flow_frag', 'fg_flow.frag'), ('fg_stat_frag', 'fg_stat.frag'), ('fg_gen_frag', 'fg_gen.frag')):
+    b = open(sys.argv[1] + '/' + f + '.spv', 'rb').read(); w = struct.unpack('<%dI' % (len(b) // 4), b)
+    out += 'static const uint32_t %s_spv[] = {%s};\n' % (name, ','.join(hex(x) for x in w))
+open(sys.argv[2], 'w').write(out); print('fgen_spv.h')
+EOF
 python3 - "$T/sgsr1_shader_mobile.frag" "$W/sgsr.frag" <<'EOF'
 import sys
 s = open(sys.argv[1], encoding='utf-8').read()
@@ -36,3 +46,16 @@ for out, head, parts in (('ovl_spv.h', 'Generated from ovl.vert / ovl.frag (glsl
     open(o + '/' + out, 'w').write('// ' + head + '\n' + ''.join(arr(p + '_spv', o + '/' + p.replace('_', '.') + '.spv') for p in parts))
     print(out)
 EOF
+# AMD FidelityFX Super Resolution 1 (MIT: dm/third_party/fsr1/license.txt): fsr_easu.frag / fsr_rcas.frag include AMD's headers as published → fsr_spv.h (the vertex
+#   shader is scale.vert's). GLSLC=<the NDK's shader-tools/.../glslc>
+GC=${GLSLC:-glslc}; W=$(mktemp -d)
+for f in fsr_easu fsr_rcas; do $GC -O --target-env=vulkan1.1 -I "$O/../../../third_party/fsr1" "$O/$f.frag" -o "$W/$f.spv"; done
+python3 - "$W" "$O/fsr_spv.h" <<'PY'
+import struct, sys
+s = "// Generated from fsr_easu.frag / fsr_rcas.frag (glslc -O, the NDK shader-tools; build_spv.sh): AMD FidelityFX Super Resolution 1 (EASU + RCAS),\n// Copyright (c) 2021 Advanced Micro Devices, Inc., MIT (dm/third_party/fsr1/license.txt)\n"
+for n in ("fsr_easu", "fsr_rcas"):
+    b = open(sys.argv[1] + "/" + n + ".spv", "rb").read(); w = struct.unpack("<%dI" % (len(b) // 4), b)
+    s += "static const uint32_t %s_frag_spv[] = {%s};\n" % (n, ",".join(hex(x) for x in w))
+open(sys.argv[2], "w").write(s); print("fsr_spv.h")
+PY
+rm -rf "$W"

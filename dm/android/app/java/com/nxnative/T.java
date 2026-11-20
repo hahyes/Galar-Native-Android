@@ -14,7 +14,7 @@ import java.util.Map;
 
 final class T {
     private T() { }
-    static final String[][] LANGS = { { "", "Auto (the phone's language)" }, { "en", "English" }, { "es", "Español" }, { "pt", "Português" }, { "fr", "Français" }, { "ja", "日本語" } };
+    static final String[][] LANGS = { { "", "Auto (the phone's language)" }, { "en", "English" }, { "es", "Espa\u00F1ol" }, { "pt", "Portugu\u00EAs" }, { "fr", "Fran\u00E7ais" }, { "ja", "\u65E5\u672C\u8A9E" } };
     private static String loaded; private static Map<String, String> map = new HashMap<>();
 
     static String lang(Context c) {

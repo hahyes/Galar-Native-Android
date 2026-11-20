@@ -9,6 +9,7 @@
 #include "front.h"
 #include <dirent.h>
 #include <errno.h>
+#include <time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -78,6 +79,11 @@ static int dm_fs_test_fail(const char *pt) {
 }
 static int in_txn_dir(const char *hp) { for (int i = 0; i < g_nmnt; i++) { size_t n = strlen(g_mnt[i].dir); if (g_mnt[i].commit[0] && !strncmp(hp, g_mnt[i].dir, n) && (hp[n] == '/' || !hp[n])) return 1; } return 0; }
 static int rm_tree(const char *p);
+static int fs_aside(const char *p) {   // 1: moved to <p>.stale-<time> (rm_tree could not delete it)
+    char to[1200]; snprintf(to, sizeof to, "%s.stale-%ld", p, (long)time(NULL));
+    if (rename(p, to)) return 0;
+    errno = 0; LOG("save transaction: %s could not be deleted (not this app's files?): moved aside to %s", p, to); return 1;
+}
 static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nmnt; i++)
@@ -97,8 +103,10 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
 #endif
         mkdir(dir, 0755);
         const char *why = NULL;
-        if (!access(work, F_OK) && rm_tree(work)) why = "cannot clear the work directory left over from last time";
-        else if (!access(neu, F_OK) && rm_tree(neu)) why = "cannot clear the .new left over from last time";
+        // a leftover that cannot be deleted (files another app or a computer copied in, owned by someone else: a .new from adb at 06:07 kept a phone's saves read-only
+        //   all day) is renamed aside instead, which needs only the parent folder's permission; the committed directory is never touched
+        if (!access(work, F_OK) && rm_tree(work) && !fs_aside(work)) why = "cannot clear the work directory left over from last time";
+        else if (!access(neu, F_OK) && rm_tree(neu) && !fs_aside(neu)) why = "cannot clear the .new left over from last time";
         else if (dm_fs_test_fail("mountclone") || clonefile(dir, work, 0)) why = "cloning the work directory failed";
         if (why) { txn_err = errno ? errno : EIO; g_mnt[g_nmnt].ro = 1; strlcpy(g_mnt[g_nmnt].dir, dir, sizeof g_mnt[0].dir);
             LOG("[RED] save transaction: %s (%s, errno=%d) -- mounting the committed directory %s read-only instead: saves cannot be written this session, the committed version is unchanged", why, work, txn_err, dir); }
@@ -469,7 +477,11 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; the mount table is permanent, unmou
 
 // ---------- Files ----------
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
-    HP(path);
+    char hp[1024]; int ro = 0;
+    {
+        PATH_LOCK();
+        if (!host_path_ex(path, hp, sizeof hp, &ro, 0)) return err_res("path", path);
+    }
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
     int fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
     if (fd < 0) return err_res("open", hp);
@@ -477,13 +489,20 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (S_ISDIR(st.st_mode)) { close(fd); return RES_PATH_NOT_FOUND; }
     if (fd >= (int)sizeof g_fmode) die("fd beyond the table");
     g_fmode[fd] = (uint8_t)mode; *out = (uint64_t)fd;
+#ifdef __linux__
+    if (!(mode & (MODE_WRITE | MODE_APPEND))) {
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    }
+#endif
     { const char *c = strchr(path, ':'); size_t ln = c ? (size_t)(c - path) : 0; g_fsave[fd] = 0;
       for (int i = 0; c && i < g_nmnt; i++) if (strlen(g_mnt[i].name) == ln && !strncmp(g_mnt[i].name, path, ln)) g_fsave[fd] = g_mnt[i].commit[0] != 0; }
     fslog_init();
     if (g_fslog && fd < 4096) { pthread_mutex_lock(&g_fslog_lock); free(g_fdpath[fd]); g_fdpath[fd] = strdup(path); pthread_mutex_unlock(&g_fslog_lock); }
     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
+    { extern void dm_fps_scene_file(const char *path); dm_fps_scene_file(path); }   // (loader.c: Sword / Shield's stadium crowd holds 30 fps)
     return RES_OK;
 }
+_Atomic uint64_t dm_fs_read_bytes;   // bytes the game has read from its files (android_main.c: a burst of reads is a load)
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) {
     if (!h) { *out = 0; return RES_FAIL; }   // a file handle is an fd; 0 is stdin and never a file the game opened: the null handle the game keeps using after a failed open
     size_t got = 0;
@@ -498,6 +517,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
                 errno = e; }
             return err_res("pread", "fd"); }
         if (r == 0) break;
+        atomic_fetch_add(&dm_fs_read_bytes, (uint64_t)r);
         got += r;
     }
     *out = got;

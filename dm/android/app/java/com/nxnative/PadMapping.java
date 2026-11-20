@@ -11,7 +11,7 @@ final class PadMapping {
     // the Switch buttons, by the names android_main.c uses, with what the settings screen calls them
     static final String[][] BUTTONS = {
         { "A", "A" }, { "B", "B" }, { "X", "X" }, { "Y", "Y" }, { "L", "L" }, { "R", "R" }, { "ZL", "ZL" }, { "ZR", "ZR" },
-        { "LS", "Left stick press" }, { "RS", "Right stick press" }, { "PLUS", "+" }, { "MINUS", "−" },
+        { "LS", "Left stick press" }, { "RS", "Right stick press" }, { "PLUS", "+" }, { "MINUS", "\u2212" },
         { "UP", "D-pad up" }, { "DOWN", "D-pad down" }, { "LEFT", "D-pad left" }, { "RIGHT", "D-pad right" },
     };
 

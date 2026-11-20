@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 .DS_Store
 # Android: built packages and signing keys
+dm/android/app/build/
 *.apk
 *.apks
 *.idsig

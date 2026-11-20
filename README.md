@@ -12,7 +12,7 @@
 
 ## Install
 
-1. Install `GalarNative.apk` from [Releases](https://github.com/simipoB/Galar-Native-Android/releases) (or [build it](docs/BUILDING.md)).
+1. Install `GalarNative-Optimized.apk` from [Releases](https://github.com/DaKaufeeBoii/Galar-Native-Android/releases) (or [build it](docs/BUILDING.md)).
 2. Choose your **game files** (`.nsp` / `.xci`, update 1.3.2, any DLC) and **keys**. Keys stay on the phone.
 3. **Set up the game.** Setup detects Sword or Shield from your files. When it's done, the app opens straight into the game.
 
@@ -29,12 +29,25 @@
 
 | GPU | Driver | Status |
 | --- | --- | --- |
-| **Adreno 6xx–8xx** (Snapdragon 845+) | Qualcomm or **Turnip** | Plays. Turnip fixes old-driver crashes (#44). |
+| **Adreno 6xx–8xx** (Snapdragon 4 Gen 1, 695, 845+) | Qualcomm or **Turnip** | Plays smoothly at 1.0x real-time speed. Use Mesa Turnip 26.2.6+ (v...-R). |
 | **Mali G57 / G68 / G77 / G78** | Stock or **PanVK** | Starts; stock driver has rendering gaps (#32). Try PanVK. |
 | **Mali G52 / G72 / G76** | Stock or PanVK | Low settings. |
 | **Mali G610–G925, Immortalis** | Stock only | White-screen fix (#40, #47), awaiting reports. |
 | **Xclipse 540 / 940** | Stock | Crash fixes (#41, #45), awaiting reports. |
 | **PowerVR** (Tensor G5 / G6) | Stock | Untested. |
+
+## What's new
+
+- **Real-Time Dynamic Game Speed (v0.99-lowspec).** Low-end SoCs (like Snapdragon 4 Gen 1 / Adreno 619) that run between 15 and 25 FPS no longer suffer from game slow-motion. Dynamic delta-time step pacing scales engine delta steps to preserve 1.0x real-time movement, battle animations, and music sync without altering game mechanics.
+- **Fast Scene Transitions & Staged Texture Burst (v0.99-lowspec).** Fixed long freezes when transitioning into battles, camping, and cooking curry. Pre-upload worker threads now burst-stage up to 32 textures per submission with single-fence synchronization, cutting multi-second loading stalls to ~30–60 ms.
+- **RomFS Mutex Decoupling & Sequential Readahead (v0.99-lowspec).** Path resolution mutex locks no longer hold through kernel file open/stat calls, preventing audio and asset streaming threads from contending during scene transitions. Added sequential kernel readahead for `.gfpak` archives.
+- **Clean UI Glyphs & Unicode Encoding Fix (v0.99-lowspec).** Fixed Windows compilation character encoding in the settings dialog, restoring proper symbols for close icons (`✕`), navigation chevrons (`›`), temperature degrees (`°C`), performance overlay separators (`·`), and international language labels (`Español`, `Português`).
+- **Mali crash fix (v0.69).** Arm's driver makes more screen buffers than the game asks for (14 for 8 on a Mali-G57). The game had room for 8, so on some Mali phones the driver closed it a few frames in (#158, #163). It now has room for 32 and uses the count the driver reports.
+- **Screen setup fallbacks (v0.72).** If a driver refuses the screen setup, the game tries again with the plainest settings every driver must accept. Before, that left a black screen.
+- **Two Mali tests (v0.72),** in ☰ → White screen tests (Mali), both off by default:
+  - *Multiply by zero as on the Switch.* On the Switch's GPU, 0 × infinity is 0. On phones it's NaN, which can show as white or glowing surfaces. This rewrites each shader's SPIR-V as it loads so that every multiply follows the Switch's rule, so you don't need to run setup again. A little slower.
+  - *Keep unused depth in tile memory.* Depth that nothing reads afterwards isn't written back to memory, which is faster on Mali. Tell us if anything flickers.
+- **Engine built with link-time optimization (v0.72).** The compiler now optimizes the whole engine at once instead of file by file. It should take less CPU time per frame; not yet measured on a phone.
 
 ## Playing
 
@@ -49,8 +62,12 @@
 | --- | --- |
 | Picture | 16:9, fill screen, 20:9 (for widescreen mods) |
 | Upscaling | Auto, Sharp, SGSR, Smooth |
-| Graphics | Auto, High (1080p), Low (720p), Adaptive |
+| Graphics | Auto, High (1080p), Low (720p), Adaptive, Lowest (540p) |
+| 3D render scale | Auto, 90 %, 80 %, 75 %, 66 %, 50 %, 45 %, 40 %, 35 % (cuts 3D load while HUD stays sharp) |
+| Game speed | Auto (Real time on budget chips), Real time (1.0x speed, no slow motion), Steady (33 ms) |
 | Textures | Auto, Full, Half; texture format (compact on Mali / Xclipse / PowerVR) |
+| Texture pre-uploading | Auto, Off (smoothest on budget chips), On (burst pre-upload) |
+| Draw submission splitting | Auto, Off, 150 draws, 100 draws (GPU/CPU concurrency) |
 | Frame rate | Auto, 30, 60 (experimental), Sword & Shield |
 | Graphics driver | Phone's own, Turnip, PanVK, or any driver package (with their options) |
 | Controls | Button layout, remapping, touch look and layout, rumble |
@@ -73,6 +90,10 @@ Import a mod `.zip` (`romfs/` file replacements, `exefs/*.pchtxt` code patches f
 
 - Nintendo's online services (Surprise Trade, online battles and raids).
 - Wild Area water renders darker than on the Switch.
+
+## License
+
+Galar Native is free software under the **GNU General Public License, version 3 or later** ([LICENSE](LICENSE), [NOTICE](NOTICE)): you may use, share and change it, and anything you distribute that is based on it must be under the same license with its source available. The code that came from d2r-mobile / nxnative, and Galar Native's code from before the switch, also stay under their original [MIT notice](LICENSE-MIT). Lossless Scaling is not included: its frame generation uses the `Lossless.dll` from your own copy.
 
 ## Credits
 

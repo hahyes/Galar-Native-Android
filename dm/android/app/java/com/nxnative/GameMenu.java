@@ -48,6 +48,18 @@ public final class GameMenu {
     private GameMenu() { }
     private static native boolean nativeSetting(String key, String value);
     private static native void nativeEditTouch();
+    private static native String nativeLsfgImport(byte[] dll, String dir);
+    private static native String nativeFramegenNote();   // android_main.c: "" making pictures (or off), "paused:<fps>", "slow:<ms>", "cost:<fps>", "off"
+    // why frame generation makes no pictures right now, for the player; null when it does (or the engine is not running)
+    private static String framegenNote(Activity a) {
+        String n; try { n = nativeFramegenNote(); } catch (UnsatisfiedLinkError e) { return null; }
+        if (n == null || n.isEmpty()) return null;
+        if (n.equals("need60")) return t(a, "Off at 30 fps: frame generation needs the game at a locked 60 fps (Performance \u2192 Frame rate: 60).");
+        if (n.startsWith("paused:")) return t(a, "Paused: the game runs at %s fps here, and frame generation needs a locked 60. It comes back on by itself once the game holds 60.", n.substring(7));
+        if (n.startsWith("cost:")) return t(a, "Off: even at its lightest it cost the game its own frames here (down to %s fps). Switch it off and on to try again.", n.substring(5));
+        if (n.startsWith("slow:")) return t(a, "Off: this GPU needs %s ms for each picture, more than the game can spare. Switch it off and on to try again.", n.substring(5));
+        return t(a, "Off until the next start (see the log for why).");
+    }   // lsfg_import.cpp: null when done, else why not
 
     // ---------- look ----------
     private static final int BG = 0xF0121419, CARD = 0xFF1C1F26, CARD_LINE = 0xFF2A2E37, TEXT = 0xFFF2F3F5, SUB = 0xFF9AA0AB, CHIP = 0xFF262A33, WARN = 0xFFFFB74D;
@@ -84,7 +96,7 @@ public final class GameMenu {
         LinearLayout head = new LinearLayout(a); head.setGravity(Gravity.CENTER_VERTICAL); head.setPadding(dp(a, 20), dp(a, 14), dp(a, 12), dp(a, 8));
         View dot = new View(a); dot.setBackground(round(accent(a), dp(a, 6), 0, 0)); head.addView(dot, new LinearLayout.LayoutParams(dp(a, 10), dp(a, 10)));
         TextView title = text(a, GameSettings.game(a)[1], 19, TEXT, true); title.setPadding(dp(a, 10), 0, 0, 0); head.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView close = text(a, "✕", 20, SUB, false); close.setPadding(dp(a, 14), dp(a, 6), dp(a, 14), dp(a, 6)); close.setOnClickListener(v -> d.dismiss()); head.addView(close);
+        TextView close = text(a, "\u2715", 20, SUB, false); close.setPadding(dp(a, 14), dp(a, 6), dp(a, 14), dp(a, 6)); close.setOnClickListener(v -> d.dismiss()); head.addView(close);
         panel.addView(head);
         LinearLayout mid = new LinearLayout(a); mid.setOrientation(LinearLayout.HORIZONTAL);
         rail = new LinearLayout(a); rail.setOrientation(LinearLayout.VERTICAL); rail.setPadding(dp(a, 10), dp(a, 4), dp(a, 6), dp(a, 10));
@@ -180,7 +192,7 @@ public final class GameMenu {
     }
     private static void action(Activity a, String title, String sub, Runnable r) {
         LinearLayout c = card(a); LinearLayout row = titleRow(a, c, title, null);
-        row.addView(text(a, "›", 22, SUB, false));
+        row.addView(text(a, "\u203A", 22, SUB, false));
         if (sub != null && !sub.isEmpty()) { TextView s = text(a, sub, 13, SUB, false); s.setPadding(0, dp(a, 4), 0, 0); c.addView(s); }
         c.setOnClickListener(v -> r.run());
     }
@@ -208,6 +220,11 @@ public final class GameMenu {
         });
         c.addView(sb);
     }
+    // a feature locked off for now (android_main.c): its title and why, in place of its choices
+    private static void lockedNote(Activity a, String title) {
+        LinearLayout c = card(a); titleRow(a, c, title, t(a, "Locked for now"));
+        c.addView(text(a, t(a, "Off for every phone until the game holds a solid frame rate without it. It comes back after that."), 13, SUB, false));
+    }
     private static void note(Activity a, String s) { TextView n = text(a, s, 13, SUB, false); n.setPadding(dp(a, 6), dp(a, 2), dp(a, 6), dp(a, 10)); body.addView(n); }
     private static TextView button(Activity a, LinearLayout parent, String label, boolean primary, Runnable r) {
         TextView b = text(a, label, 14, primary ? Color.WHITE : TEXT, true); b.setGravity(Gravity.CENTER); b.setPadding(dp(a, 16), dp(a, 9), dp(a, 16), dp(a, 9));
@@ -224,13 +241,24 @@ public final class GameMenu {
         String was = GameSettings.get(a, key);
         GameSettings.set(a, key, value);
         boolean now;
+        if (a instanceof GameActivity && (key.equals("DM_FRAMEGEN") || key.equals("DM_FPS_TARGET"))) ((GameActivity) a).displayMode();   // (the screen's rate follows the pictures shown)
+        if (key.equals("DM_SAVE_SHARED") && value.equals("1") && android.os.Build.VERSION.SDK_INT >= 30 && !android.os.Environment.isExternalStorageManager())   // (save_place needs it)
+            try { a.startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, android.net.Uri.parse("package:" + a.getPackageName()))); } catch (Exception e) { }
         if (key.equals("DM_PERF_OVERLAY")) { if (a instanceof GameActivity) ((GameActivity) a).perfOverlay(value.equals("on")); now = true; }
+        else if (key.equals("DM_SUSTAINED")) { if (a instanceof GameActivity) ((GameActivity) a).sustained(); now = true; }
         else if (key.equals("DM_LANG")) now = true;
         else if (key.equals("DM_RUMBLE")) {   // (controller / phone: at once; off and back on: the game's motors, from the next start)
             now = !value.equals("off") && !was.equals("off");
             try { nativeSetting(key, value); } catch (UnsatisfiedLinkError e) { }   // (the touch buttons' click follows Rumble unless set apart: touch_ui.c)
         }
         else { try { now = nativeSetting(key, value); } catch (UnsatisfiedLinkError e) { now = false; } }
+        // Widescreen (loader.c wide_patch): the camera is widened as the game loads, to this screen's own aspect (its long side over its short), so from the next
+        //   start; to or from it, the picture's box changes at once but the camera only then
+        if (key.equals("DM_ASPECT")) {
+            if (value.equals("wide")) { android.util.DisplayMetrics dm = new android.util.DisplayMetrics(); a.getWindowManager().getDefaultDisplay().getRealMetrics(dm);
+                int l = Math.max(dm.widthPixels, dm.heightPixels), s = Math.min(dm.widthPixels, dm.heightPixels);
+                if (s > 0) GameSettings.set(a, "DM_WIDE_RATIO", String.format(java.util.Locale.ROOT, "%.4f", (double) l / s)); }
+            if (value.equals("wide") || was.equals("wide")) now = false; }
         if (!now) RESTART.add(key);
     }
 
@@ -238,11 +266,34 @@ public final class GameMenu {
     private static void display(Activity a) {
         heading(a, t(a, "Screen"));
         choice(a, "DM_ASPECT", t(a, "Picture"), new String[][] { { "", "16:9", t(a, "16:9, as the game is made") }, { "fill", t(a, "Fill"), t(a, "Fill the screen (stretched)") },
-                                                                    { "20:9", "20:9", t(a, "20:9, for a widescreen mod") } });
+                                                                    { "20:9", "20:9", t(a, "20:9, for a widescreen mod") },
+            { "wide", t(a, "Widescreen"), t(a, "Widescreen: the game's camera made as wide as your screen, nothing stretched (Sword / Shield 1.3.2; the HUD is stretched)") } });
         String rec = GameSettings.profile(a)[6].equals("sgsr") ? "SGSR" : t(a, "Sharp");
         choice(a, "DM_SCALER", t(a, "Upscaling"), new String[][] { { "", t(a, "Auto"), t(a, "Auto: this phone gets %s", rec) },
             { "sharp", t(a, "Sharp"), t(a, "Sharp: the picture upscaled with sharpening (lighter settings keep their detail)") },
-            { "sgsr", "SGSR", t(a, "Snapdragon Game Super Resolution (Qualcomm's upscaler)") }, { "smooth", t(a, "Smooth"), t(a, "Smooth: a plain stretch") } });
+            { "sgsr", "SGSR", t(a, "Snapdragon Game Super Resolution (Qualcomm's upscaler)") },
+            { "fsr", "FSR", t(a, "AMD FidelityFX Super Resolution 1: edge-aware upscaling, then sharpening (Sharpness sets how much)") }, { "smooth", t(a, "Smooth"), t(a, "Smooth: a plain stretch") } });
+        // the picture's colour, graded in the upscaler's last shader (nvn_vk.c color_mode): live
+        choice(a, "DM_COLOR", t(a, "Colour"), new String[][] { { "", t(a, "Natural"), t(a, "Natural: the colours as the game draws them") },
+            { "vibrant", t(a, "Vibrant"), t(a, "Vibrant: muted colours lifted, a touch more contrast (less grey haze)") }, { "cinematic", t(a, "Cinematic"), t(a, "Cinematic: stronger contrast, a slightly warm tone") } });
+        // Frame generation (nvn_vk.c, nvn_fgen.h): off unless the player turns it on, on any GPU; takes effect at once
+        //   Lossless Scaling's (nvn_lsfg.h): offered once the player has imported their own Lossless.dll (its shaders, converted, in files/lsfg)
+        String[][] fgc = { { "", t(a, "Off"), "" },
+            { "on", t(a, "On"), t(a, "On: a picture is made between each two of the game's frames, so 60 fps moves like 120. Only while the game holds a locked 60 fps; your input shows about 8 ms later") },
+            { "lsfg", "Lossless Scaling", t(a, "Lossless Scaling: the in-between picture made by your own copy of Lossless Scaling's frame generation (sharper motion, needs a faster GPU)") } };
+        if (!GameSettings.experimentsUnlocked(a)) { lockedNote(a, t(a, "Frame generation (experimental)")); } else {   // (locked off for now: android_main.c)
+        choice(a, "DM_FRAMEGEN", t(a, "Frame generation (experimental)"), GameSettings.hasLsfg(a) ? fgc : java.util.Arrays.copyOf(fgc, 2));
+        { String fn = framegenNote(a); if (fn != null) note(a, fn); }   // (paused under 25 fps, or cut off for the GPU's time: said here, not only in the log)
+        if (GameSettings.hasLsfg(a))   // Lossless Scaling's pictures a game frame (nvn_vk.c lsfg_mult); Auto: as many as the display's rate divides evenly
+            choice(a, "DM_LSFG_MULT", t(a, "Lossless Scaling pictures"), new String[][] {
+                { "", t(a, "Auto"), t(a, "Auto: 2x, light (the game at a locked 60 shown at 120)") },
+                { "2", "2x", t(a, "2x: one picture between each two of the game's frames (30 fps moves like 60)") },
+                { "3", "3x", t(a, "3x: two pictures between each two frames (like 90 fps; even on a 90 Hz screen only)") },
+                { "4", "4x", t(a, "4x: three pictures between each two frames (like 120 fps; needs a 120 Hz screen and a fast GPU)") } });
+        if (!GameSettings.hasLsfg(a)) {   // (the player's own copy: Lossless Scaling is a paid app, nothing of it comes with this one)
+            note(a, t(a, "Own Lossless Scaling? Import its Lossless.dll (in the program's folder) to use its frame generation here."));
+            LinearLayout lr = new LinearLayout(a); body.addView(lr);
+            button(a, lr, t(a, "Import Lossless.dll"), false, () -> pick(a, Intent.ACTION_OPEN_DOCUMENT, null, REQ_LSFG)); } }
         // HD textures: the player's own retexture mods (Mods), on Auto only on phones with the memory for them (GameSettings.profile, android_main.c mod_root);
         //   offered once such a mod is in the mods folder
         if (GameSettings.hasTexturePack(a)) {
@@ -261,27 +312,56 @@ public final class GameMenu {
         heading(a, t(a, "Speed"));
         String g = t(a, p[2].equals("high") ? "High" : p[2].equals("auto") ? "Adaptive" : "Low");
         String[][] gfx = { { "", t(a, "Auto"), t(a, "Auto: this phone gets %s", g) }, { "high", t(a, "High"), t(a, "High: TV mode, 1080p, full effects") },
-            { "low", t(a, "Low"), t(a, "Low: handheld mode, 720p, lighter") }, { "auto", t(a, "Adaptive"), t(a, "Adaptive: High, a lighter picture while the phone is hot or slow") },
+            { "low", t(a, "Low"), t(a, GameSettings.paldea(a) ? "Low: handheld mode, 720p, lighter" : "Low: 3D at about 600p, lighter") }, { "auto", t(a, "Adaptive"), t(a, "Adaptive: High, a lighter picture while the phone is hot or slow") },
             // Lowest: handheld mode with the game's 3D render scale capped (Pokémon Sword / Shield: the engine's hle_resscale.c; Scarlet / Violet have no such scale)
-            { "lowest", t(a, "Lowest"), t(a, "Lowest: handheld mode, 3D at 960x540, coolest") } };
+            { "lowest", t(a, "Lowest"), t(a, GameSettings.paldea(a) ? "Lowest: handheld mode, 3D at 960x540, coolest" : "Lowest: 3D at 960x540, coolest") } };
         choice(a, "DM_GRAPHICS", t(a, "Graphics"), GameSettings.paldea(a) ? java.util.Arrays.copyOf(gfx, 4) : gfx);
+        // the game's own 3D render scale, capped (android_main.c DM_RES_CAP, hle_resscale.c): Sword / Shield, at once. The HUD and text stay sharp; only the 3D is drawn smaller
+        if (!GameSettings.paldea(a)) choice(a, "DM_RES_CAP", t(a, "3D render scale"), new String[][] {
+            { "", t(a, "Auto"), t(a, "Auto: what the Graphics setting gives, lowered by itself when the phone is hot") },
+            { "0.90", "90 %", "" }, { "0.80", "80 %", "" }, { "0.75", "75 %", "" }, { "0.66", "66 %", "" },
+            { "0.50", "50 %", t(a, "50 %: the 3D at half size (text and menus stay sharp)") },
+            { "0.45", "45 %", "" },
+            { "0.40", "40 %", t(a, "40 %: low-end chip performance mode, coolest and fastest") },
+            { "0.35", "35 %", t(a, "35 %: maximum performance for budget chips") } });
+        choice(a, "DM_VK_SPLIT", t(a, "Draw submission splitting"), new String[][] {
+            { "", t(a, "Auto"), t(a, "Auto: default for this game (Off for Sword/Shield)") },
+            { "0", t(a, "Off"), t(a, "Off: all draws in one submission") },
+            { "150", t(a, "150 draws"), t(a, "150 draws: hands work to GPU earlier, overlaps CPU and GPU") },
+            { "100", t(a, "100 draws"), t(a, "100 draws: aggressive GPU concurrency for budget chips") } });
         if (GameSettings.has60(a)) choice(a, "DM_FPS_TARGET", t(a, "Frame rate"), new String[][] { { "", t(a, "Auto"), t(a, "Auto: this phone gets %s fps", p[5]) },
             { "30", "30 fps", t(a, "30 fps, as the game is made") }, { "60", "60 fps", GameSettings.paldea(a) ? t(a, "Up to 60 fps: faster where the phone can, game speed stays right (Fl4sh's Dynamic FPS mod)")
                                                                                                : t(a, "60 fps: smoother; drops to 720p when needed to hold 60 (with Graphics on Auto or Adaptive)") } });
+        if (!GameSettings.paldea(a)) choice(a, "DM_GAME_STEP", t(a, "Game speed"), new String[][] {
+            { "", t(a, "Auto"), t(a, "Auto: Real time on budget chips (no slow motion), Steady on high-end chips") },
+            { "realtime", t(a, "Real time"), t(a, "Real time: normal game speed even when FPS drops below 30 (no slow motion)") },
+            { "steady", t(a, "Steady"), t(a, "Steady: fixed 33 ms step (runs in slow motion if FPS drops below 30)") } });
+        if (GameActivity.sustainedSupported(a)) choice(a, "DM_SUSTAINED", t(a, "Sustained performance"), new String[][] {
+            { "", t(a, "Off"), t(a, "Off: the phone's full speed, which drops when it gets hot") }, { "on", t(a, "On"), t(a, "On: a speed the phone can hold for hours, fewer slowdowns when hot") } });
         heading(a, t(a, "Memory"));
         choice(a, "DM_VK_TEX_QUALITY", t(a, "Textures"), new String[][] { { "", t(a, "Auto"), t(a, "Auto: this phone gets %s", t(a, p[3].equals("half") ? "Half" : "Full")) },
             { "full", t(a, "Full"), t(a, "Full: the game's textures as they are") }, { "half", t(a, "Half"), t(a, "Half: large textures at half size, less memory and GPU work") } });
         choice(a, "DM_VK_BC_TRANSCODE", t(a, "Texture format"), new String[][] { { "", t(a, "Auto"), t(a, "Auto: compact on GPUs without BC (Mali, Xclipse, PowerVR), converted once and kept") },
             { "off", t(a, "Full decode"), t(a, "Full decode: more memory, no conversion (Snapdragon is not affected either way)") } });
+        choice(a, "DM_VK_PREUPLOAD", t(a, "Texture pre-uploading"), new String[][] {
+            { "", t(a, "Auto"), t(a, "Auto: default (Off on budget chips to avoid GPU stalls)") },
+            { "0", t(a, "Off"), t(a, "Off: uploads textures on-demand in frame passes (smoothest on budget chips)") },
+            { "1", t(a, "On"), t(a, "On: uploads ahead in background (for high-end GPUs)") } });
     }
     private static void controls(Activity a) {
         heading(a, t(a, "Controller"));
         choice(a, "DM_PAD_LAYOUT", t(a, "Controller buttons"), new String[][] { { "", t(a, "By position"), t(a, "By position, as on a Switch pad") },
                                                                                  { "labels", t(a, "By label"), t(a, "By label (the button marked A is A)") } });
-        action(a, t(a, "Remap controller buttons"), t(a, "Or hold − for 3 s on a controller. Hold − and + together for 1 s to open this menu."), () -> go("remap"));
+        action(a, t(a, "Remap controller buttons"), t(a, "Or hold \u2212 for 3 s on a controller. Hold \u2212 and + together for 1 s to open this menu."), () -> go("remap"));
         choice(a, "DM_RUMBLE", t(a, "Rumble"), new String[][] { { "", t(a, "On"), t(a, "On: the controller's motor, else the phone's") }, { "pad", t(a, "Controllers only"), "" },
                                                                  { "off", t(a, "Off"), "" } });
+        // the right stick / camera, touch and controller alike (hle_hid.c rsens)
+        choice(a, "DM_RSTICK_SENS", t(a, "Camera sensitivity"), new String[][] { { "50", "50 %", t(a, "Slower camera: the right stick and the touch camera turn less") }, { "75", "75 %", "" },
+            { "", "100 %", t(a, "As on the Switch") }, { "125", "125 %", "" }, { "150", "150 %", t(a, "Faster camera: full speed with less of the stick") }, { "200", "200 %", "" } });
         heading(a, t(a, "Touch controls"));
+        // the sticks (touch_ui.c float_on): fixed where the layout puts them, or floating (the left one comes to the thumb; the right half drags the camera)
+        choice(a, "DM_TOUCH_STICKS", t(a, "Sticks"), new String[][] { { "", t(a, "Fixed"), t(a, "Fixed: the sticks stay where they are drawn, as on Joy-Cons") },
+            { "floating", t(a, "Floating"), t(a, "Floating: touch anywhere on the left half to move (the stick comes to your thumb); drag on the right half to turn the camera") } });
         // L3 / R3 (pressing the sticks, touch_ui.c): off by default, Sword and Shield hardly use them (the left stick whistles in the Wild Area)
         choice(a, "DM_TOUCH_L3R3", t(a, "L3 / R3 buttons"), new String[][] { { "", t(a, "Off"), t(a, "Off: no L3 / R3 on screen (a controller's stick buttons still work)") },
                                                                              { "on", t(a, "On"), t(a, "On: L3 and R3 above the sticks (move them with Move the touch controls)") } });
@@ -290,7 +370,7 @@ public final class GameMenu {
                                                                                 { "on", t(a, "On"), "" }, { "off", t(a, "Off"), "" } });
         slider(a, t(a, "Opacity"), "DM_TOUCH_OPACITY", 20, 100, 100, v -> v + " %");
         slider(a, t(a, "Fade after"), "DM_TOUCH_FADE", 0, 10, 3, v -> v == 0 ? t(a, "never fade") : t(a, "%d s without a touch", v));
-        action(a, t(a, "Move the touch controls"), t(a, "Drag a control to move it, pinch to resize, double-tap to hide. Hold − for 2 s to save (hold + to reset)."), () -> {
+        action(a, t(a, "Move the touch controls"), t(a, "Drag a control to move it. To resize one, touch it, then pinch with two fingers anywhere. Double-tap to hide. Hold \u2212 for 2 s to save (hold + to reset)."), () -> {
             if (dlg != null) dlg.dismiss(); try { nativeEditTouch(); } catch (UnsatisfiedLinkError e) { } });
     }
     // Remapping (PadMapping.java, DM_PAD_MAPPING): tap a Switch button, then press the controller key for it (the panel takes the key: remapKey)
@@ -302,7 +382,7 @@ public final class GameMenu {
         for (String[] btn : PadMapping.BUTTONS) {
             LinearLayout c = card(a); LinearLayout row = titleRow(a, c, btn[1], null);
             Integer kc = map.get(btn[0]); boolean wait = btn[0].equals(capture);
-            row.addView(text(a, wait ? t(a, "Press a key…") : kc != null ? PadMapping.keyName(kc) : t(a, "default"), 14, wait ? accent(a) : SUB, wait));
+            row.addView(text(a, wait ? t(a, "Press a key\u2026") : kc != null ? PadMapping.keyName(kc) : t(a, "default"), 14, wait ? accent(a) : SUB, wait));
             if (wait) c.setBackground(round(CARD, dp(a, 16), dp(a, 2), accent(a)));
             c.setOnClickListener(x -> { capture = btn[0]; redraw(); });
         }
@@ -367,13 +447,13 @@ public final class GameMenu {
         for (File m : ms) {
             boolean on = !m.getName().startsWith("-");
             LinearLayout c = card(a); LinearLayout row = titleRow(a, c, plain(m), null); row.addView(pill(a, on ? t(a, "On") : t(a, "Off"), on));
-            if (cf.containsKey(m)) { TextView w = text(a, "⚠ " + t(a, "shares files with %d other mod(s)", cf.get(m).size()), 13, WARN, false); w.setPadding(0, dp(a, 4), 0, 0); c.addView(w); }
+            if (cf.containsKey(m)) { TextView w = text(a, "\u26A0 " + t(a, "shares files with %d other mod(s)", cf.get(m).size()), 13, WARN, false); w.setPadding(0, dp(a, 4), 0, 0); c.addView(w); }
             c.setOnClickListener(v -> { if (m.renameTo(new File(m.getParentFile(), on ? "-" + plain(m) : plain(m)))) RESTART.add("mods"); redraw(); });
         }
         note(a, where(a));
     }
     private static String where(Activity a) {
-        return t(a, "Put each mod in its own folder in Android/data/%s/files/mods/ — <mod>/romfs for files, <mod>/exefs for .pchtxt code patches (they must be made for %s %s).",
+        return t(a, "Put each mod in its own folder in Android/data/%s/files/mods/ \u2014 <mod>/romfs for files, <mod>/exefs for .pchtxt code patches (they must be made for %s %s).",
                  a.getPackageName(), GameSettings.game(a)[1], GameSettings.version(a));
     }
     // the load order: higher wins; each mod's notes, the files it shares, moving it, deleting it
@@ -388,19 +468,19 @@ public final class GameMenu {
             Map<File, Integer> sh = cf.get(m);
             if (sh != null) for (Map.Entry<File, Integer> e : sh.entrySet()) {
                 boolean wins = ms.indexOf(m) < ms.indexOf(e.getKey());
-                TextView w = text(a, "⚠ " + t(a, wins ? "Replaces %d of the same files as %s: this mod's are used (it is higher)." : "Replaces %d of the same files as %s: that mod's are used (it is higher).", e.getValue(), plain(e.getKey())), 13, WARN, false);
+                TextView w = text(a, "\u26A0 " + t(a, wins ? "Replaces %d of the same files as %s: this mod's are used (it is higher)." : "Replaces %d of the same files as %s: that mod's are used (it is higher).", e.getValue(), plain(e.getKey())), 13, WARN, false);
                 w.setPadding(0, dp(a, 4), 0, 0); c.addView(w);
             }
             LinearLayout r = new LinearLayout(a); c.addView(r);
-            if (i > 0) button(a, r, "↑ " + t(a, "Move up"), false, () -> { java.util.Collections.swap(ms, k, k - 1); saveOrder(a, ms); RESTART.add("mods"); redraw(); });
-            if (i < ms.size() - 1) button(a, r, "↓ " + t(a, "Move down"), false, () -> { java.util.Collections.swap(ms, k, k + 1); saveOrder(a, ms); RESTART.add("mods"); redraw(); });
+            if (i > 0) button(a, r, "\u2191 " + t(a, "Move up"), false, () -> { java.util.Collections.swap(ms, k, k - 1); saveOrder(a, ms); RESTART.add("mods"); redraw(); });
+            if (i < ms.size() - 1) button(a, r, "\u2193 " + t(a, "Move down"), false, () -> { java.util.Collections.swap(ms, k, k + 1); saveOrder(a, ms); RESTART.add("mods"); redraw(); });
             button(a, r, t(a, "Edit notes"), false, () -> notes(a, m));
             button(a, r, t(a, "Delete"), false, () -> confirm(a, t(a, "Delete this mod from the phone?"), () -> { deleteTree(m); ms.remove(m); saveOrder(a, ms); RESTART.add("mods"); go("order"); }));
         }
         LinearLayout r = new LinearLayout(a); body.addView(r); button(a, r, t(a, "Done"), true, () -> go("mods"));
     }
     private static void notes(Activity a, File m) {
-        body.removeAllViews(); heading(a, plain(m) + " · " + t(a, "Notes"));
+        body.removeAllViews(); heading(a, plain(m) + " \u00B7 " + t(a, "Notes"));
         LinearLayout c = card(a); EditText e = field(a, c, ""); e.setSingleLine(false); e.setMinLines(5); e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         try { e.setText(new String(java.nio.file.Files.readAllBytes(new File(m, "notes.txt").toPath()), java.nio.charset.StandardCharsets.UTF_8)); } catch (IOException x) { }
         LinearLayout r = new LinearLayout(a); body.addView(r);
@@ -415,11 +495,22 @@ public final class GameMenu {
     }
 
     // ---------- saves, online, system ----------
+    // the folder the save is in now (android_main.c save_place: save_place.txt says "shared" while it is in Documents/Galar Native/<title id>/save)
+    static File activeSave(Activity a, File files) {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(new File(files, "save_place.txt")))) {
+            String l = r.readLine();
+            if (l != null && l.trim().equals("shared")) return new File("/storage/emulated/0/Documents/Galar Native/" + GameSettings.game(a)[0].toUpperCase(java.util.Locale.ROOT) + "/save");
+        } catch (java.io.IOException e) { }
+        return new File(files, "save");
+    }
     private static void saves(Activity a) {
         heading(a, t(a, "Saves"));
         action(a, t(a, "Export save data"), t(a, "Save in the game first: the export is the last save the game wrote."),
                () -> pick(a, Intent.ACTION_CREATE_DOCUMENT, GameSettings.game(a)[2] + "-save.zip", REQ_EXPORT));
         action(a, t(a, "Import save data"), t(a, "Your current save is kept as a backup."), () -> pick(a, Intent.ACTION_OPEN_DOCUMENT, null, REQ_IMPORT));
+        // where the save lives (android_main.c save_place, Arceus-Native-Android#8): Documents for a sync tool; copied over at the next start, the earlier save there kept as a backup
+        choice(a, "DM_SAVE_SHARED", t(a, "Save folder"), new String[][] { { "", t(a, "App folder"), t(a, "App folder: Android/data, as before") },
+            { "1", t(a, "Documents"), t(a, "Documents/Galar Native/%s/save, for sync tools such as Syncthing. Your save is copied there at the next start; anything already there is kept as a backup. Needs All files access", GameSettings.game(a)[0].toUpperCase(java.util.Locale.ROOT)) } });
     }
     // Online room (hle_relay.c, dm/server): local play with players elsewhere through a room server someone hosts (their own Railway service, or any PC); everyone enters the
     // same server address and room code. Applies from the next start; mods stay off for local play, as on Wi-Fi
@@ -437,7 +528,7 @@ public final class GameMenu {
         if (!room.isEmpty()) button(a, r, t(a, "Leave room"), false, () -> { GameSettings.set(a, "DM_RELAY_ROOM", ""); RESTART.add("DM_RELAY_ROOM"); go("online"); });
     }
     // About: whether this copy is an official build (BuildSigner: signed with the release key), the credits, and the licences the APK carries (assets/licenses,
-    //   build_apk.py). The app is MIT: its copyright and licence notice must stay with every copy, so a repack that strips this page breaks the licence
+    //   build_apk.py). The app is GPL-3.0-or-later (its older code also MIT): its copyright and licence notice must stay with every copy, so a repack that strips this page breaks the licence
     private static String asset(Activity a, String name) {
         try (java.io.InputStream in = a.getAssets().open(name)) {
             java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream(); byte[] b = new byte[8192]; for (int n; (n = in.read(b)) > 0; ) o.write(b, 0, n); return o.toString("UTF-8");
@@ -463,11 +554,12 @@ public final class GameMenu {
         c.addView(link);
         // the credits: the copyright lines of the app's licence, then the licence itself
         String own = asset(a, "licenses/LICENSE.txt"); StringBuilder who = new StringBuilder();
-        for (String l : own.split("\n")) if (l.trim().startsWith("Copyright")) who.append(l.trim()).append('\n');
+        for (String l : own.split("\n")) { String s_ = l.trim();   // (not the GPL text's own copyright line, and each holder once: NOTICE and LICENSE-MIT both name them)
+            if (s_.startsWith("Copyright") && !s_.contains("Free Software Foundation") && who.indexOf(s_) < 0) who.append(s_).append('\n'); }
         if (who.length() == 0) who.append("Copyright (c) 2026 jhaizhou (d2r-mobile, nxnative)\nCopyright (c) 2026 the Galar Native (formerly PKShield Android) contributors\n");
         heading(a, t(a, "Credits"));
         LinearLayout cc = card(a); cc.addView(text(a, who.toString().trim(), 14, TEXT, false));
-        TextView mit = text(a, t(a, "Free software under the MIT License. This notice must stay with every copy."), 13, SUB, false); mit.setPadding(0, dp(a, 6), 0, 0); cc.addView(mit);
+        TextView mit = text(a, t(a, "Free software under the GNU GPL, version 3 or later (older parts also MIT). This notice must stay with every copy, and the source of every release is public."), 13, SUB, false); mit.setPadding(0, dp(a, 6), 0, 0); cc.addView(mit);
         if (!own.isEmpty()) reveal(a, cc, t(a, "Show the license"), own);
         // the third-party code and fonts (licenses/index.tsv: file, name, what it is)
         heading(a, t(a, "Third-party code"));
@@ -488,8 +580,9 @@ public final class GameMenu {
         // the replay on its own thread (hle_nvn.c DM_NVN_ASYNC): the game's thread hands each frame's graphics work over instead of translating it itself (about a quarter
         //   of a frame on a slow CPU, #99). Off by default until players have run it on many phones
         heading(a, t(a, "Performance"));
-        choice(a, "DM_NVN_ASYNC", t(a, "Faster rendering (experimental)"), new String[][] { { "", t(a, "Off"), "" },
-            { "1", t(a, "On"), t(a, "On: the graphics work runs on its own thread, next to the game's. Not tested on every phone yet: if the game misbehaves, turn it off and tell us on GitHub") } });
+        choice(a, "DM_NVN_ASYNC", t(a, "Faster rendering"), new String[][] { { "", t(a, "Auto"), t(a, "Auto: on for Adreno GPUs, off for others") },
+            { "1", t(a, "On"), t(a, "On: the graphics work runs on its own thread, next to the game's. Not tested on every phone yet: if the game misbehaves, turn it off and tell us on GitHub") },
+            { "0", t(a, "Off"), t(a, "Off: the graphics work runs on the game's own thread") } });
         // a frame capture for a bug report (nvn_vk.c, Frame capture): the engine reads capture.req (frames to wait, so the menu can be closed first) and writes the ZIP
         heading(a, t(a, "Bug reports"));
         action(a, t(a, "Capture a frame"), t(a, "Close this menu within 3 seconds and stay where the problem shows: the next frame is saved, step by step, as pictures and notes in Download (a ZIP ending in frame-capture.zip). Attach it to your issue."),
@@ -506,6 +599,25 @@ public final class GameMenu {
                 { "0", t(a, "Off"), t(a, "Off: the shaders as before v0.52") } });
             choice(a, "DM_VK_NAN_MINMAX", t(a, "Min / max as on the Switch"), new String[][] { { "", t(a, "Auto"), t(a, "Auto: on with ARM's driver (v0.57)") },
                 { "0", t(a, "Off"), t(a, "Off: the shaders as before v0.57") } });
+            choice(a, "DM_VK_FMZ", t(a, "Multiply by zero as on the Switch"), new String[][] { { "", t(a, "Auto"), t(a, "Auto: on with PanVK (black patches), off with the phone's own Mali driver") },
+                { "1", t(a, "On"), t(a, "On: a multiply with a zero gives zero even when the other value is infinite, as the Switch's GPU does (a test for white or glowing surfaces; a little slower)") },
+                { "0", t(a, "Off"), t(a, "Off: plain multiplies, as before v0.74") } });
+            // the white-screen probe (nvn_spv.c spv_probe, #215): one kind of value clamped in every fragment shader; the run where the white goes names the kind
+            choice(a, "DM_VK_PROBE", t(a, "White-screen probe"), new String[][] { { "", t(a, "Off"), "" },
+                { "samples", t(a, "Textures"), t(a, "Textures: every texture read is limited to a sane range. If the white goes away, tell us: a texture is read wrong") },
+                { "inputs", t(a, "Inputs"), t(a, "Inputs: every value the vertex shader hands over is limited. If the white goes away, tell us") },
+                { "div", t(a, "Divisions"), t(a, "Divisions: every division is limited. If the white goes away, tell us") },
+                { "output", t(a, "Output"), t(a, "Output: what each shader writes is limited. If the white goes away, tell us") },
+                { "mul", t(a, "Multiplies"), t(a, "Multiplies: every multiply result is limited. If the white goes away, tell us") },
+                { "add", t(a, "Additions"), t(a, "Additions: every add / subtract result is limited. If the white goes away, tell us") },
+                { "fma", t(a, "Multiply-adds"), t(a, "Multiply-adds: every fused multiply-add result is limited. If the white goes away, tell us") },
+                { "nanfix", t(a, "NaN fix"), t(a, "NaN fix: broken values the shaders write become 0 instead of turning the picture white. Tell us how it looks") },
+                { "nanfix,nantex", t(a, "NaN fix + textures"), t(a, "NaN fix + textures: the same, and broken values read from textures become 0 too. Tell us how it looks") },
+                { "f16target", t(a, "Float target"), t(a, "Float target: the lit scene stored in a 16-bit float picture instead of the packed one. If the white goes away, tell us") } });
+            choice(a, "DM_VK_DEPTH_DISCARD", t(a, "Keep unused depth in tile memory"), new String[][] { { "", t(a, "Off"), "" },
+                { "1", t(a, "On"), t(a, "On: depth that nothing reads afterwards is not written back to memory (faster on Mali; a test: tell us if anything flickers)") } });
+            choice(a, "DM_VK_B10_AS_RGBA16", t(a, "Bright scenes in a wider format"), new String[][] { { "", t(a, "Off"), "" },
+                { "1", t(a, "On"), t(a, "On: the lit scene is drawn in a format with more room (RGBA16F instead of R11G11B10F), a test for white or flickering pictures; uses a little more memory") } });
             choice(a, "DM_VK_NO_PASS_MERGE", t(a, "Merge render passes"), new String[][] { { "", t(a, "On"), "" },
                 { "1", t(a, "Off"), t(a, "Off: every render target change starts a new pass") } });
         }
@@ -533,12 +645,12 @@ public final class GameMenu {
     }
     private static void driverRow(Activity a, String name, boolean on, Runnable use) {
         LinearLayout c = card(a); LinearLayout row = titleRow(a, c, name, null);
-        if (on) { row.addView(text(a, "✓", 18, accent(a), true)); c.setBackground(round(CARD, dp(a, 16), dp(a, 2), accent(a))); }
+        if (on) { row.addView(text(a, "\u2713", 18, accent(a), true)); c.setBackground(round(CARD, dp(a, 16), dp(a, 2), accent(a))); }
         c.setOnClickListener(v -> { use.run(); RESTART.add("driver"); redraw(); });
     }
 
     // ---------- files: save data out and in, mods and drivers in (the system file picker; GameActivity.onActivityResult hands the answer here) ----------
-    static final int REQ_EXPORT = 101, REQ_IMPORT = 102, REQ_MOD = 103, REQ_DRIVER = 104;
+    static final int REQ_EXPORT = 101, REQ_IMPORT = 102, REQ_MOD = 103, REQ_DRIVER = 104, REQ_LSFG = 105;
     private static void pick(Activity a, String action, String name, int req) {
         // (to open, any file: ZIPs saved by browsers and chat apps are often typed otherwise, and the picker greyed them out; a save ZIP is checked when read)
         Intent i = new Intent(action); i.addCategory(Intent.CATEGORY_OPENABLE); i.setType(Intent.ACTION_OPEN_DOCUMENT.equals(action) ? "*/*" : "application/zip");
@@ -546,16 +658,22 @@ public final class GameMenu {
         a.startActivityForResult(i, req);
     }
     static boolean onResult(Activity a, int req, int res, Intent data) {
-        if (req != REQ_EXPORT && req != REQ_IMPORT && req != REQ_MOD && req != REQ_DRIVER) return false;
+        if (req != REQ_EXPORT && req != REQ_IMPORT && req != REQ_MOD && req != REQ_DRIVER && req != REQ_LSFG) return false;
         Uri u = res == Activity.RESULT_OK && data != null ? data.getData() : null; if (u == null) return true;
         File files = GameSettings.dir(a);
         new Thread(() -> {
             String msg;
             try {
                 if (req == REQ_DRIVER) msg = DriverPackages.install(a, u, displayName(a, u));
+                else if (req == REQ_LSFG) {   // the DLL read whole (about 3 MB), its shaders converted into files/lsfg (android_main.c DM_LSFG_DIR)
+                    java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                    try (InputStream in = a.getContentResolver().openInputStream(u)) { byte[] b = new byte[1 << 16]; int k; long tot = 0;
+                        while ((k = in.read(b)) > 0) { bo.write(b, 0, k); if ((tot += k) > (64L << 20)) throw new IOException("the file is too large for Lossless.dll"); } }
+                    String why = nativeLsfgImport(bo.toByteArray(), new File(GameSettings.root(a), "lsfg").getPath());
+                    msg = why == null ? t(a, "Lossless Scaling imported. Choose it under Frame generation.") : t(a, "Could not import Lossless Scaling: %s", why); }
                 else if (req == REQ_EXPORT) {
                     try (OutputStream o = a.getContentResolver().openOutputStream(u, "wt"); ZipOutputStream z = new ZipOutputStream(o)) {
-                        File save = new File(files, "save").getCanonicalFile(); int n = zipTree(save, save, z); msg = t(a, "Exported %d save file(s).", n); }
+                        File save = activeSave(a, files).getCanonicalFile(); int n = zipTree(save, save, z); msg = t(a, "Exported %d save file(s).", n); }
                 } else if (req == REQ_IMPORT) {
                     try (InputStream in = a.getContentResolver().openInputStream(u)) {
                         int n = SaveImport.install(in, new File(files, "save_import"), displayName(a, u));
@@ -572,7 +690,7 @@ public final class GameMenu {
             final String m = msg;
             a.runOnUiThread(() -> {   // (the answer in the panel's status line, on the page it belongs to)
                 if (dlg == null) open(a, null);
-                if (req == REQ_MOD) { RESTART.add("mods"); go("mods"); } else if (req == REQ_DRIVER) go("driver"); else go("saves");
+                if (req == REQ_MOD) { RESTART.add("mods"); go("mods"); } else if (req == REQ_DRIVER) go("driver"); else if (req == REQ_LSFG) redraw(); else go("saves");
                 say(m);
             });
         }).start();
